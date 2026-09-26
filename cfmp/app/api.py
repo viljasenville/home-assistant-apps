@@ -193,6 +193,7 @@ def predict(req: PredictRequest) -> PredictResponse:
     # Without an explicit model, use whichever backend holds this instance.
     model = req.model or store.find_model_for(req.model_id)
     if model is None:
+        _LOGGER.warning("Predict for %s: no trained model found", req.model_id)
         raise errors.not_found(
             f"No trained model found for model_id '{req.model_id}'. Train first."
         )
@@ -214,6 +215,9 @@ def predict(req: PredictRequest) -> PredictResponse:
     tail_records = [h.model_dump() for h in (req.history_tail or [])]
     if backend.autoregressive:
         if not tail_records:
+            _LOGGER.warning(
+                "Predict for %s/%s rejected: no history_tail", backend.id, req.model_id
+            )
             raise errors.conflict(
                 "history_tail_required",
                 f"Model '{backend.id}' needs a history_tail of at least "
@@ -222,6 +226,10 @@ def predict(req: PredictRequest) -> PredictResponse:
         history = TS.to_frame(tail_records)
         history = history.loc[: origin - pd.Timedelta(hours=1)]
         if len(history) < backend.lag_hours:
+            _LOGGER.warning(
+                "Predict for %s/%s rejected: history_tail %d < %d hours",
+                backend.id, req.model_id, len(history), backend.lag_hours,
+            )
             raise errors.conflict(
                 "history_tail_too_short",
                 f"history_tail covers {len(history)} hours before the forecast "
@@ -232,6 +240,11 @@ def predict(req: PredictRequest) -> PredictResponse:
     else:
         history = future.iloc[:0]
 
+    _LOGGER.debug(
+        "Predicting %s/%s: %d hours from %s, %d history hours",
+        backend.id, req.model_id, len(future), origin, len(history),
+    )
+    started = time.perf_counter()
     combined = TS.merge_for_prediction(history, future) if len(history) else future
     values = backend.predict(
         state,
@@ -240,6 +253,11 @@ def predict(req: PredictRequest) -> PredictResponse:
         base_temp=base_temp,
         future_index=future.index,
         origin=origin,
+    )
+    _LOGGER.info(
+        "Predicted %s/%s: %d hours from %s in %.2f s, total %.2f kWh",
+        backend.id, req.model_id, len(future), origin,
+        time.perf_counter() - started, float(sum(values)),
     )
 
     return PredictResponse(

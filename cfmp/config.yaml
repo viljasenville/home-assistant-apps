@@ -1,6 +1,6 @@
 ---
 name: Consumption Forecast Model Provider
-version: "2026.9.0"
+version: "2026.9.1"
 slug: cfmp
 description: >-
   Trains and serves a LightGBM consumption forecast model in a container.
