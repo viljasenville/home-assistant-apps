@@ -2,29 +2,50 @@
 # shellcheck shell=bash
 set -e
 
-export CFM_LOG_LEVEL="$(bashio::config 'log_level')"
-export CFM_DEFAULT_MODEL="$(bashio::config 'default_model')"
-export CFM_BASE_TEMP="$(bashio::config 'base_temp')"
-export CFM_NUM_THREADS="$(bashio::config 'num_threads')"
-export CFM_MAX_HISTORY_ROWS="$(bashio::config 'max_history_rows')"
-export CFM_KEEP_MODEL_VERSIONS="$(bashio::config 'keep_model_versions')"
+# Options are read straight from /data/options.json, which Supervisor writes
+# before starting the add-on. bashio::config is deliberately not used: it
+# fetches the options over the Supervisor API, so a container started without
+# Supervisor (docker run with a mounted /data, which is how CI verifies the
+# image) silently gets no options at all — including no api_token, leaving the
+# API open. Reading the file keeps both paths identical.
+readonly OPTIONS_FILE=/data/options.json
+
+# Empty output means "not set", and app/config.py applies its own default, so
+# the defaults live in exactly one place.
+option() {
+    local key="${1}"
+    [ -f "${OPTIONS_FILE}" ] || return 0
+    jq -r --arg k "${key}" \
+        'if has($k) and (.[$k] != null) then (.[$k] | tostring) else "" end' \
+        "${OPTIONS_FILE}" 2>/dev/null || true
+}
+
+if [ ! -f "${OPTIONS_FILE}" ]; then
+    bashio::log.warning "${OPTIONS_FILE} not found — starting with built-in defaults."
+fi
+
+export CFM_LOG_LEVEL="$(option log_level)"
+export CFM_DEFAULT_MODEL="$(option default_model)"
+export CFM_BASE_TEMP="$(option base_temp)"
+export CFM_NUM_THREADS="$(option num_threads)"
+export CFM_MAX_HISTORY_ROWS="$(option max_history_rows)"
+export CFM_KEEP_MODEL_VERSIONS="$(option keep_model_versions)"
+export CFM_API_TOKEN="$(option api_token)"
 export CFM_DATA_DIR="/data"
 export CFM_PORT="8099"
 
-if bashio::config.has_value 'api_token'; then
-    export CFM_API_TOKEN="$(bashio::config 'api_token')"
+if [ -n "${CFM_API_TOKEN}" ]; then
     bashio::log.info "API requires a bearer token."
 else
-    export CFM_API_TOKEN=""
     bashio::log.warning "api_token is empty — the API is open to anyone who can reach the port."
 fi
 
 # Calendar features are computed in local time, so the timezone matters.
 export CFM_TIMEZONE="${TZ:-UTC}"
-export OMP_NUM_THREADS="${CFM_NUM_THREADS}"
+export OMP_NUM_THREADS="${CFM_NUM_THREADS:-2}"
 
 bashio::log.info "Timezone: ${CFM_TIMEZONE}"
-bashio::log.info "Default model: ${CFM_DEFAULT_MODEL}"
+bashio::log.info "Default model: ${CFM_DEFAULT_MODEL:-lightgbm}"
 bashio::log.info "Starting Consumption Forecast Model Provider on port ${CFM_PORT}..."
 cd /opt/app || bashio::exit.nok "Application directory /opt/app not found"
 exec /opt/venv/bin/python -m app.server
