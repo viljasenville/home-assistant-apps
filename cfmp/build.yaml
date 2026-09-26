@@ -1,0 +1,10 @@
+---
+# Debian base images are glibc-based, so the LightGBM manylinux wheel
+# installs straight from PyPI.
+build_from:
+  amd64: ghcr.io/home-assistant/amd64-base-debian:bookworm
+  aarch64: ghcr.io/home-assistant/aarch64-base-debian:bookworm
+
+labels:
+  org.opencontainers.image.source: https://github.com/viljasenville/home-assistant-apps
+  org.opencontainers.image.licenses: Apache-2.0

@@ -1,0 +1,30 @@
+#!/command/with-contenv bashio
+# shellcheck shell=bash
+set -e
+
+export CFM_LOG_LEVEL="$(bashio::config 'log_level')"
+export CFM_DEFAULT_MODEL="$(bashio::config 'default_model')"
+export CFM_BASE_TEMP="$(bashio::config 'base_temp')"
+export CFM_NUM_THREADS="$(bashio::config 'num_threads')"
+export CFM_MAX_HISTORY_ROWS="$(bashio::config 'max_history_rows')"
+export CFM_KEEP_MODEL_VERSIONS="$(bashio::config 'keep_model_versions')"
+export CFM_DATA_DIR="/data"
+export CFM_PORT="8099"
+
+if bashio::config.has_value 'api_token'; then
+    export CFM_API_TOKEN="$(bashio::config 'api_token')"
+    bashio::log.info "API requires a bearer token."
+else
+    export CFM_API_TOKEN=""
+    bashio::log.warning "api_token is empty — the API is open to anyone who can reach the port."
+fi
+
+# Calendar features are computed in local time, so the timezone matters.
+export CFM_TIMEZONE="${TZ:-UTC}"
+export OMP_NUM_THREADS="${CFM_NUM_THREADS}"
+
+bashio::log.info "Timezone: ${CFM_TIMEZONE}"
+bashio::log.info "Default model: ${CFM_DEFAULT_MODEL}"
+bashio::log.info "Starting Consumption Forecast Model Provider on port ${CFM_PORT}..."
+cd /opt/app || bashio::exit.nok "Application directory /opt/app not found"
+exec /opt/venv/bin/python -m app.server

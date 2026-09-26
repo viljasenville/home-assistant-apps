@@ -1,0 +1,56 @@
+---
+name: Consumption Forecast Model Provider
+version: "2026.9.0"
+slug: cfmp
+description: >-
+  Trains and serves a LightGBM consumption forecast model in a container.
+url: https://github.com/viljasenville/home-assistant-apps/tree/main/cfmp
+
+# Prebuilt image from GHCR. With this field set, Supervisor pulls instead of
+# building on the device. {arch} is substituted at install time and the tag
+# comes from the version field above.
+# Comment the line out for local development to build from the Dockerfile
+# instead. A fork must point this at its own account: the publish workflow
+# refuses to release to a GHCR path the repository owner does not own.
+image: ghcr.io/viljasenville/home-assistant-apps/{arch}-addon-cfmp
+
+# LightGBM publishes wheels for these architectures only. On armv7 the
+# integration's built-in profile model remains the only option.
+arch:
+  - amd64
+  - aarch64
+
+init: false
+startup: services
+boot: auto
+
+# The service is always reachable inside the Supervisor network at
+# http://local-cfmp:8099 . Publishing a host port is optional and only needed
+# to call the API from outside Home Assistant.
+ports:
+  8099/tcp: null
+ports_description:
+  8099/tcp: HTTP API (leave empty unless you need external access)
+
+watchdog: "http://[HOST]:[PORT:8099]/health"
+
+options:
+  log_level: info
+  api_token: ""
+  default_model: lightgbm
+  base_temp: 17.0
+  num_threads: 2
+  max_history_rows: 70000
+  keep_model_versions: 3
+
+schema:
+  log_level: list(trace|debug|info|notice|warning|error|fatal)
+  api_token: password?
+  # Backend used when a request omits "model". Callers discover the full list
+  # at runtime from GET /models, so new backends need no change here.
+  default_model: str
+  # Heating threshold (°C) for hours whose request carries no target.
+  base_temp: float(-20,40)
+  num_threads: int(1,16)
+  max_history_rows: int(1000,500000)
+  keep_model_versions: int(1,20)

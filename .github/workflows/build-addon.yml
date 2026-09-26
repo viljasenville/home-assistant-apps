@@ -1,0 +1,260 @@
+name: Build and publish add-on images
+
+# Handles any number of add-ons in this repository. Each add-on lives in its
+# own directory with a config.yaml; the workflow discovers them rather than
+# listing them (see .github/scripts/discover.py, which has its own tests).
+#
+# To release one add-on:
+#   git tag cfmp-v2026.9.0
+#   git push origin cfmp-v2026.9.0
+#
+# The tag's version must match the add-on's config.yaml, or the run fails
+# before building anything.
+#
+# A push or pull request builds only the add-ons whose files changed, without
+# publishing, so a broken Dockerfile is caught before release.
+
+on:
+  push:
+    branches: [main]
+    tags: ["*-v*", "v*"]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      addon:
+        description: "Add-on slug, or 'all'"
+        default: "all"
+      publish:
+        description: "Publish to GHCR"
+        type: boolean
+        default: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.pick.outputs.matrix }}
+      tests: ${{ steps.pick.outputs.tests }}
+      publish: ${{ steps.pick.outputs.publish }}
+      any: ${{ steps.pick.outputs.any }}
+      selected: ${{ steps.pick.outputs.selected }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Collect changed files
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+            head="${{ github.event.pull_request.head.sha }}"
+          else
+            base="${{ github.event.before }}"
+            head="${{ github.sha }}"
+          fi
+          # A first push, a force push or a shallow clone leaves no usable
+          # base; treating every file as changed is the safe direction.
+          if [ -z "${base}" ] || ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+            git ls-files > /tmp/changed.txt
+          else
+            git diff --name-only "${base}" "${head}" > /tmp/changed.txt
+          fi
+          echo "Changed files:"; sed 's/^/  /' /tmp/changed.txt | head -40
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install parser dependency
+        run: python3 -m pip install --quiet pyyaml
+
+      # The discovery script decides what gets published, so it is tested
+      # before it is trusted. Seconds, and no add-on is built if it is broken.
+      - name: Test the discovery script
+        run: python3 .github/scripts/discover_test.py
+
+      - name: Decide what to build
+        id: pick
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          CHANGED_FILES_FILE: /tmp/changed.txt
+          INPUT_ADDON: ${{ inputs.addon || 'all' }}
+          INPUT_PUBLISH: ${{ inputs.publish || 'false' }}
+        run: python3 .github/scripts/discover.py
+
+  # An add-on's own test suite, if it ships one as .ci/test.sh. Runs before
+  # any image is built: a contract or logic regression should fail in seconds
+  # rather than after two container builds. Add-ons without the script are
+  # simply absent from this matrix.
+  test:
+    needs: discover
+    if: fromJSON(needs.discover.outputs.tests).include[0] != null
+    name: ${{ matrix.slug }} tests
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.discover.outputs.tests) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Through bash and through env, like the verify step: a lost executable
+      # bit in git must not silently skip an add-on's tests.
+      - name: Run ${{ matrix.dir }}/.ci/test.sh
+        env:
+          ADDON_DIR: ${{ matrix.dir }}
+        run: bash "${ADDON_DIR}/.ci/test.sh"
+
+  build:
+    needs: [discover, test]
+    # always(), because test is skipped for an add-on that ships no test.sh and
+    # a skipped dependency would otherwise skip the build too. A failed suite
+    # must stop the build, since publishing happens in this job.
+    if: >-
+      always()
+      && needs.discover.result == 'success'
+      && needs.discover.outputs.any == 'true'
+      && needs.test.result != 'failure'
+      && needs.test.result != 'cancelled'
+    name: ${{ matrix.slug }} ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.discover.outputs.matrix) }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        if: needs.discover.outputs.publish == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build image
+        env:
+          IMAGE: ${{ matrix.image }}
+          VERSION: ${{ matrix.version }}
+          ADDON_DIR: ${{ matrix.dir }}
+        run: |
+          set -euo pipefail
+          docker build \
+            --build-arg "BUILD_FROM=${{ matrix.base }}" \
+            --build-arg "BUILD_ARCH=${{ matrix.arch }}" \
+            --build-arg "BUILD_VERSION=${VERSION}" \
+            --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --label "org.opencontainers.image.licenses=Apache-2.0" \
+            --tag "${IMAGE}:${VERSION}" \
+            --tag "${IMAGE}:latest" \
+            "${ADDON_DIR}"
+
+      # Starts the image the way Supervisor would, with an options.json in
+      # place, so a broken build fails here rather than on someone's device.
+      # Nothing here is add-on specific: the port and the default options are
+      # read from the add-on's config.yaml and arrive through the matrix. An
+      # add-on wanting more can add .ci/options.json and .ci/verify.sh.
+      - name: Verify the container starts
+        env:
+          IMAGE: ${{ matrix.image }}
+          VERSION: ${{ matrix.version }}
+          ADDON_DIR: ${{ matrix.dir }}
+          ADDON_OPTIONS: ${{ matrix.options }}
+          ADDON_PORT: ${{ matrix.port }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/addon-data
+
+          # Supervisor hands the add-on its settings as /data/options.json.
+          # The defaults come from config.yaml (passed through the matrix);
+          # an add-on needing different ones in CI provides .ci/options.json.
+          if [ -f "${ADDON_DIR}/.ci/options.json" ]; then
+            cp "${ADDON_DIR}/.ci/options.json" /tmp/addon-data/options.json
+            echo "Using ${ADDON_DIR}/.ci/options.json"
+          else
+            printf '%s' "${ADDON_OPTIONS}" > /tmp/addon-data/options.json
+            echo "Using the defaults from config.yaml"
+          fi
+          cat /tmp/addon-data/options.json
+
+          port="${ADDON_PORT:-}"
+          args=(-d --name addon-test -e TZ=Europe/Helsinki -v /tmp/addon-data:/data)
+          if [ -n "${port}" ]; then
+            args+=(-p "${port}:${port}")
+          fi
+          docker run "${args[@]}" "${IMAGE}:${VERSION}"
+
+          if [ -z "${port}" ]; then
+            # No HTTP surface to probe, so just confirm it stays up.
+            sleep 15
+            if [ "$(docker inspect -f '{{.State.Running}}' addon-test)" != "true" ]; then
+              echo "::error::Container exited shortly after starting."
+              docker logs addon-test
+              exit 1
+            fi
+            echo "Container is still running after 15 s."
+            docker rm -f addon-test > /dev/null
+            exit 0
+          fi
+
+          base_url="http://localhost:${port}"
+          for i in $(seq 1 30); do
+            if curl -fsS "${base_url}/health" > /tmp/health.json 2>/dev/null; then
+              echo "Health check responded after ${i} attempts:"
+              cat /tmp/health.json; echo
+              # Invoked through bash, so a lost executable bit in git does
+              # not silently skip the add-on's own checks.
+              if [ -f "${ADDON_DIR}/.ci/verify.sh" ]; then
+                echo "Running ${ADDON_DIR}/.ci/verify.sh"
+                BASE_URL="${base_url}" bash "${ADDON_DIR}/.ci/verify.sh"
+              fi
+              docker rm -f addon-test > /dev/null
+              exit 0
+            fi
+            sleep 2
+          done
+
+          echo "::error::Container did not answer ${base_url}/health within 60 seconds."
+          docker logs addon-test
+          exit 1
+
+      - name: Publish to GHCR
+        if: needs.discover.outputs.publish == 'true'
+        env:
+          IMAGE: ${{ matrix.image }}
+          VERSION: ${{ matrix.version }}
+        run: |
+          set -euo pipefail
+          docker push "${IMAGE}:${VERSION}"
+          docker push "${IMAGE}:latest"
+          echo "Published \`${IMAGE}:${VERSION}\`" >> "$GITHUB_STEP_SUMMARY"
+
+  summary:
+    needs: [discover, build]
+    if: always() && needs.build.result == 'success' && needs.discover.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Package visibility reminder
+        run: |
+          {
+            echo "## Published: ${{ needs.discover.outputs.selected }}"
+            echo
+            echo "Each add-on's GHCR packages must be **public** once, per architecture:"
+            echo "GitHub → Packages → the package → Package settings →"
+            echo "Change visibility → Public."
+            echo
+            echo "Supervisor has no GitHub credentials and cannot pull a private package."
+          } >> "$GITHUB_STEP_SUMMARY"

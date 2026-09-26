@@ -1,0 +1,535 @@
+openapi: 3.1.0
+info:
+  title: Consumption Forecast Model Service
+  version: 1.0.0
+  description: |
+    HTTP API for an out-of-Home-Assistant model service (typically packaged as a
+    Home Assistant **add-on** or a sidecar Docker container on a glibc host, so
+    libraries such as LightGBM that have no musllinux wheels can still be used).
+
+    Design principles:
+
+    - **The service is stateless about Home Assistant.** The integration owns the
+      data: it reads the recorder, assembles the hourly series, and sends it here.
+      The service only trains models and produces forecasts. It never queries
+      Home Assistant.
+    - **Model-agnostic.** The set of usable models is discovered at runtime from
+      `GET /models` — the integration does not hard-code model names. `train` and
+      `predict` take an optional `model` field; when omitted the service picks its
+      configured default. New model backends (e.g. XGBoost, scikit-learn) can be
+      added later without changing this contract; at launch only `lightgbm` is
+      offered.
+    - **Trained models are persisted** by the service under a caller-supplied
+      `model_id` (e.g. the integration's config entry id), so several Home
+      Assistant configurations can share one service.
+    - **Same data shape as the integration's internal model**, so the payloads map
+      directly from the integration's assembled hourly series.
+
+    All timestamps are ISO 8601 with an explicit offset. Energy is kWh per hour,
+    temperatures are °C.
+
+servers:
+  - url: http://homeassistant.local:8099
+    description: Add-on on the Home Assistant host (example port)
+  - url: http://{host}:{port}
+    description: Sidecar container on another machine
+    variables:
+      host:
+        default: 192.168.1.50
+      port:
+        default: "8099"
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: meta
+    description: Health and capability discovery
+  - name: models
+    description: Discover available model backends
+  - name: training
+    description: Train and manage trained models
+  - name: forecast
+    description: Produce forecasts
+
+paths:
+  /health:
+    get:
+      tags: [meta]
+      summary: Liveness / readiness probe
+      description: |
+        Lightweight check the integration calls before trusting the service. If
+        this does not return 200, the integration falls back to its built-in
+        profile model.
+      security: []            # health is unauthenticated so probes are simple
+      operationId: getHealth
+      responses:
+        "200":
+          description: Service is up.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Health"
+              example:
+                status: ok
+                version: "1.0.0"
+                default_model: lightgbm
+
+  /models:
+    get:
+      tags: [models]
+      summary: List available model backends
+      description: |
+        The authoritative list of models this service can train and serve. The
+        integration reads this to populate its model choices dynamically instead
+        of hard-coding names, and marks which is the default. At launch this
+        returns a single entry, `lightgbm`.
+      operationId: listModels
+      responses:
+        "200":
+          description: The models this service offers.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ModelList"
+              example:
+                default: lightgbm
+                models:
+                  - id: lightgbm
+                    name: LightGBM
+                    description: >-
+                      Gradient-boosted trees at hour level with lag and rolling
+                      features. Recursive multi-step forecasting.
+                    available: true
+                    min_hours: 1440
+                    autoregressive: true
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /models/{model}:
+    get:
+      tags: [models]
+      summary: Describe one model backend
+      operationId: getModel
+      parameters:
+        - $ref: "#/components/parameters/ModelId"
+      responses:
+        "200":
+          description: The model's capabilities and requirements.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ModelInfo"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /train:
+    post:
+      tags: [training]
+      summary: Train a model on a supplied hourly history
+      description: |
+        Trains the chosen model on the provided hourly series and persists it
+        under `model_id`. Returns the time-ordered validation MAE (kWh/h) so the
+        integration can compare it with its own profile model and keep whichever
+        is more accurate. Synchronous; training may take from seconds to a few
+        minutes, so callers should use a generous timeout.
+      operationId: trainModel
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TrainRequest"
+      responses:
+        "200":
+          description: Training finished (see `trained`).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TrainResponse"
+              example:
+                trained: true
+                model: lightgbm
+                model_id: 1a2b3c4d5e6f
+                val_mae: 0.184
+                n_hours: 8760
+                trained_at: "2026-09-26T03:00:00+03:00"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: The requested `model` is not available on this service.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "422":
+          description: |
+            Not enough usable data to train (e.g. fewer than the model's
+            `min_hours`). The integration treats this like its own
+            "not enough data" case and keeps using the profile model.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TrainResponse"
+              example:
+                trained: false
+                model: lightgbm
+                reason: insufficient_data
+                n_hours: 240
+
+  /predict:
+    post:
+      tags: [forecast]
+      summary: Forecast future hours with a trained model
+      description: |
+        Returns an hourly forecast. Because tree models here are autoregressive,
+        the caller supplies a `history_tail` (the most recent actual hours, at
+        least the model's required lag depth) for the lag/rolling features, plus
+        the `future` hours to predict (temperature and target only).
+      operationId: predict
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PredictRequest"
+      responses:
+        "200":
+          description: The hourly forecast.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PredictResponse"
+              example:
+                model: lightgbm
+                hourly:
+                  - ts: "2026-09-26T13:00:00+03:00"
+                    kwh: 2.13
+                  - ts: "2026-09-26T14:00:00+03:00"
+                    kwh: 1.98
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: No trained model found for `model_id` (train first).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: |
+            `history_tail` is shorter than the model needs for its lag features
+            (see `min_hours` / lag depth in the model info).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /models/{model}/instances/{model_id}:
+    get:
+      tags: [training]
+      summary: Metadata of a trained model instance
+      description: |
+        Diagnostics for a previously trained model without retraining — validation
+        MAE, when it was trained, hours used, and (where the backend supports it)
+        feature importances. Useful for the integration's diagnostic attributes.
+      operationId: getInstance
+      parameters:
+        - $ref: "#/components/parameters/ModelId"
+        - $ref: "#/components/parameters/ModelInstanceId"
+      responses:
+        "200":
+          description: The trained instance's metadata.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InstanceInfo"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      tags: [training]
+      summary: Delete a trained model instance
+      description: Called when the integration's config entry is removed.
+      operationId: deleteInstance
+      parameters:
+        - $ref: "#/components/parameters/ModelId"
+        - $ref: "#/components/parameters/ModelInstanceId"
+      responses:
+        "204":
+          description: Deleted (idempotent — 204 even if it did not exist).
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: >-
+        A shared token configured in the add-on/sidecar and in the integration.
+        Sent as `Authorization: Bearer <token>`.
+
+  parameters:
+    ModelId:
+      name: model
+      in: path
+      required: true
+      description: A model backend id from `GET /models` (e.g. `lightgbm`).
+      schema:
+        type: string
+    ModelInstanceId:
+      name: model_id
+      in: path
+      required: true
+      description: The caller-supplied id a trained model was stored under.
+      schema:
+        type: string
+
+  responses:
+    Unauthorized:
+      description: Missing or invalid bearer token.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    BadRequest:
+      description: Malformed request body.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    NotFound:
+      description: Resource not found.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+
+  schemas:
+    Health:
+      type: object
+      required: [status, version]
+      properties:
+        status:
+          type: string
+          enum: [ok]
+        version:
+          type: string
+          description: Service version.
+        default_model:
+          type: string
+          description: The model id used when a request omits `model`.
+
+    ModelList:
+      type: object
+      required: [default, models]
+      properties:
+        default:
+          type: string
+          description: Default model id when a request omits `model`.
+        models:
+          type: array
+          items:
+            $ref: "#/components/schemas/ModelInfo"
+
+    ModelInfo:
+      type: object
+      required: [id, name, available]
+      properties:
+        id:
+          type: string
+          description: Stable identifier used in `train`/`predict` (e.g. `lightgbm`).
+        name:
+          type: string
+          description: Human-readable name.
+        description:
+          type: string
+        available:
+          type: boolean
+          description: >-
+            Whether this backend can actually run on this deployment (its library
+            is installed). A model may be listed but unavailable.
+        min_hours:
+          type: integer
+          description: Minimum usable training hours the model needs.
+          examples: [1440]
+        autoregressive:
+          type: boolean
+          description: >-
+            If true, `predict` requires a `history_tail` for lag features and
+            forecasts recursively.
+
+    HourActual:
+      type: object
+      description: One historical hour (with the measured energy).
+      required: [ts, energy, out_temp]
+      properties:
+        ts:
+          type: string
+          format: date-time
+          description: Start of the hour, ISO 8601 with offset.
+        energy:
+          type: number
+          description: Consumption for the hour (kWh).
+        out_temp:
+          type: number
+          description: Outdoor temperature (°C).
+        target:
+          type: number
+          description: >-
+            Indoor target/threshold temperature used for heating-degree-hours
+            (°C). Optional; the service uses `base_temp` if absent.
+
+    HourFuture:
+      type: object
+      description: One future hour to forecast (no energy).
+      required: [ts, out_temp]
+      properties:
+        ts:
+          type: string
+          format: date-time
+        out_temp:
+          type: number
+          description: Forecast outdoor temperature (°C).
+        target:
+          type: number
+          description: Target/threshold temperature (°C). Optional.
+
+    HourForecast:
+      type: object
+      required: [ts, kwh]
+      properties:
+        ts:
+          type: string
+          format: date-time
+        kwh:
+          type: number
+          description: Forecast consumption for the hour (kWh).
+
+    TrainRequest:
+      type: object
+      required: [model_id, series]
+      properties:
+        model:
+          type: string
+          description: >-
+            Model backend id (from `GET /models`). Omit to use the service
+            default. At launch only `lightgbm` is offered.
+        model_id:
+          type: string
+          description: Id to store the trained model under (e.g. config entry id).
+        base_temp:
+          type: number
+          description: >-
+            Default heating threshold (°C) used for hours whose `target` is
+            absent.
+        series:
+          type: array
+          minItems: 24
+          description: Chronological hourly history to train on.
+          items:
+            $ref: "#/components/schemas/HourActual"
+
+    TrainResponse:
+      type: object
+      required: [trained, model]
+      properties:
+        trained:
+          type: boolean
+        model:
+          type: string
+          description: The model that was trained.
+        model_id:
+          type: string
+        val_mae:
+          type: number
+          nullable: true
+          description: >-
+            Time-ordered validation MAE in kWh per hour. Comparable with the
+            integration's profile-model `val_mae`. Null if not computable.
+        n_hours:
+          type: integer
+          description: Usable hours after feature construction.
+        trained_at:
+          type: string
+          format: date-time
+        reason:
+          type: string
+          description: Present when `trained` is false (e.g. `insufficient_data`).
+
+    PredictRequest:
+      type: object
+      required: [model_id, future]
+      properties:
+        model:
+          type: string
+          description: Model backend id. Omit to use the trained instance's model.
+        model_id:
+          type: string
+          description: The id the model was trained under.
+        history_tail:
+          type: array
+          description: >-
+            Recent actual hours for lag/rolling features, oldest first. Required
+            for autoregressive models; length must cover the model's lag depth.
+          items:
+            $ref: "#/components/schemas/HourActual"
+        future:
+          type: array
+          minItems: 1
+          description: Future hours to forecast, chronological.
+          items:
+            $ref: "#/components/schemas/HourFuture"
+
+    PredictResponse:
+      type: object
+      required: [model, hourly]
+      properties:
+        model:
+          type: string
+        hourly:
+          type: array
+          items:
+            $ref: "#/components/schemas/HourForecast"
+
+    InstanceInfo:
+      type: object
+      required: [model, model_id]
+      properties:
+        model:
+          type: string
+        model_id:
+          type: string
+        val_mae:
+          type: number
+          nullable: true
+        n_hours:
+          type: integer
+        trained_at:
+          type: string
+          format: date-time
+        feature_importance:
+          type: object
+          additionalProperties:
+            type: number
+          description: >-
+            Per-feature importance where the backend exposes it (e.g. LightGBM
+            gain). May be absent.
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+          description: Short machine-readable code (e.g. `not_found`, `unauthorized`).
+        message:
+          type: string
+          description: Human-readable detail.

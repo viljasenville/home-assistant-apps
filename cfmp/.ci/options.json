@@ -1,0 +1,9 @@
+{
+  "log_level": "info",
+  "api_token": "smoketest",
+  "default_model": "lightgbm",
+  "base_temp": 17.0,
+  "num_threads": 2,
+  "max_history_rows": 70000,
+  "keep_model_versions": 3
+}

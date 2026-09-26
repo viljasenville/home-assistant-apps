@@ -1,0 +1,8 @@
+# No scikit-learn: cross-validation and metrics are computed in-house,
+# which keeps roughly 100 MB out of the image.
+lightgbm==4.6.0
+numpy==2.1.3
+pandas==2.2.3
+fastapi==0.115.6
+uvicorn==0.34.0
+pydantic==2.10.4
